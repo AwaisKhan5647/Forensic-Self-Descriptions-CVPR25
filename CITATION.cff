@@ -1,19 +1,11 @@
 cff-version: 1.2.0
-message: "If you use this software, please cite it as below."
-title: "Forensic Self-Descriptions Are All You Need for Zero-Shot Detection, Open-Set Source Attribution, and Clustering of AI-generated Images"
+message: "If you use this software, please cite the original paper as below."
+title: "Forensic Self-Descriptions: Zero-Shot AI-Generated Image Detection — Evaluation Deployment"
 type: software
 authors:
-  - given-names: Tai D.
-    family-names: Nguyen
-    email: tdn47@drexel.edu
-    affiliation: Drexel University
-  - given-names: Aref
-    family-names: Azizpour
-    affiliation: Drexel University
-  - given-names: Matthew C.
-    family-names: Stamm
-    affiliation: Drexel University
-repository-code: "https://github.com/ductai199x/Forensic-Self-Descriptions-CVPR25"
+  - given-names: Awais
+    family-names: Khan
+repository-code: "https://github.com/AwaisKhan5647/Forensic-Self-Descriptions-CVPR25"
 url: "https://arxiv.org/abs/2503.21003"
 license: CC-BY-NC-SA-4.0
 keywords:
