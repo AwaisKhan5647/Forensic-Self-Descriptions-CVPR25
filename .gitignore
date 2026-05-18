@@ -1,8 +1,55 @@
+# ── Python build artefacts ────────────────────────────────────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 *.egg-info/
-.venv/
+*.egg
 dist/
 build/
-internal/
+.eggs/
+*.so
+*.pyd
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.env
+
+# ── uv / pip cache ────────────────────────────────────────────────────────────
+.uv/
+pip-wheel-metadata/
+
+# ── Weights / model files ─────────────────────────────────────────────────────
+# Pre-trained weights are auto-downloaded at runtime (~/.cache/fsd/)
 weights/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+internal/
+
+# ── Evaluation outputs (generated at runtime, not source-controlled) ──────────
+Results/
+
+# ── Logs and runtime state ────────────────────────────────────────────────────
+logs/
+*.log
+nohup.out
+
+# ── IDE and OS artefacts ──────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+*.tmp
+*.bak
