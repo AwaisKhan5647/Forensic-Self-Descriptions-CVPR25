@@ -1,0 +1,285 @@
+================================================================================
+SYSTEM INFERENCE — FSD (Forensic Self-Descriptions) Evaluation Pipeline
+Forensic Self-Descriptions Are All You Need for Zero-Shot Detection,
+Open-Set Source Attribution, and Clustering of AI-Generated Images (CVPR 2025)
+================================================================================
+
+AUTHORS: Tai D. Nguyen, Aref Azizpour, Matthew C. Stamm (Drexel University)
+PAPER:   https://arxiv.org/abs/2503.21003
+REPO:    https://github.com/ductai199x/Forensic-Self-Descriptions-CVPR25
+
+────────────────────────────────────────────────────────────────────────────────
+1. OVERVIEW
+────────────────────────────────────────────────────────────────────────────────
+
+FSD is a zero-shot AI-generated image detector. It is trained EXCLUSIVELY on
+real images and generalises to any unseen generator (StyleGAN, Stable Diffusion,
+DALL-E, Midjourney, etc.) with a reported average AUC of 96.0% across 24
+generator types.
+
+The core insight: real photographs leave a characteristic statistical signature
+in their pixel-level "forensic residuals". AI-generated images, regardless of
+the generator, produce residuals whose statistics deviate measurably from this
+real-image baseline. This deviation is captured by a Gaussian Mixture Model
+(GMM) trained solely on real images.
+
+────────────────────────────────────────────────────────────────────────────────
+2. MODEL ARCHITECTURE — HOW IT WORKS (STEP BY STEP)
+────────────────────────────────────────────────────────────────────────────────
+
+STEP 1 — IMAGE LOADING & PREPROCESSING
+  • Input: any image file (JPG, PNG, WEBP, HEIC, …)
+  • Convert to grayscale (L-channel only)
+  • Represent as a float64 tensor of shape (1, H, W)  [values in 0–255]
+  • Reasoning: forensic residuals are more reliably extracted from luminance;
+    float64 prevents rounding errors that would corrupt the subtle residuals.
+
+STEP 2 — FORENSIC RESIDUAL EXTRACTION (FRE)
+  • A small constrained Conv2d (1→8 channels, 15×15 kernel) called the
+    Forensic Residual Extractor (FRE) is applied to the grayscale image.
+  • The kernel weights satisfy prediction-error filter constraints:
+      – each filter sums to zero at the centre pixel
+      – off-centre weights sum to one
+    This forces the network to model the local prediction of each pixel from
+    its neighbours, and the residual (image − prediction) captures anomalous
+    high-frequency patterns introduced by generators.
+  • Output residuals: shape (8, H, W) — 8 forensic channels per pixel.
+  • Border pixels corrupted by padding are stripped (7-pixel border removed).
+  • TF32 is explicitly disabled on Ampere+ GPUs to preserve float64 precision.
+
+STEP 3 — SCALE NORMALISATION (resize_and_crop)
+  • Resize: scale the shorter edge to exactly 1024 px (bilinear, no antialias).
+  • Crop:   centre-crop to 1024×1024.
+  • Effect: all images become (8, 1024, 1024) residual tensors regardless of
+    their original resolution. This makes the descriptor size fixed and
+    resolution-invariant.
+
+STEP 4 — MULTI-SCALE PATCH DECOMPOSITION
+  • The residual tensor is processed at 3 scales: 1× (1024²), ½× (512²), ¼× (256²).
+  • At each scale the tensor is padded (reflect) and unfolded into overlapping
+    11×11 patches across all spatial positions.
+  • Patch tensor shapes per scale:
+      Scale 0: (1,048,576 patches, 8 channels, 11×11)
+      Scale 1: (  262,144 patches, 8 channels, 11×11)
+      Scale 2: (   65,536 patches, 8 channels, 11×11)
+    Total: ~1.38 million patches per image.
+  • Capturing multiple scales makes the descriptor sensitive to forensic
+    patterns at both fine and coarse spatial frequencies.
+
+STEP 5 — CONSTRAINED LEAST-SQUARES (FSD COMPUTATION)
+  • For each scale the central pixel of each patch is predicted from its
+    11×11−1 = 120 neighbours using a constrained linear model:
+      y = X · w   subject to  sum(w_k) = 1  for each of the 8 FRE channels
+  • The constraint enforces that the prediction weights integrate to a valid
+    normalised filter, preventing trivial solutions.
+  • The system is solved via KKT conditions (augmented linear system):
+      [XᵀX + λI   Aᵀ] [w ] = [Xᵀy]
+      [A           0 ] [μ ] = [1  ]
+    where A encodes the sum-to-one constraint per channel, λ=1e-5 regularises.
+  • Computation is memory-efficient: XᵀX and Xᵀy are accumulated in chunks
+    (chunk_size=16384) to avoid materialising the full (1.38M × 960) matrix.
+  • All arithmetic is float64 on GPU for numerical stability.
+  • Output: a single 960-dimensional FSD vector  (K=8 channels × 120 features)
+    that compactly summarises the self-prediction structure of the image's
+    forensic residuals.
+
+STEP 6 — LEARNED PROJECTION (WHITENING / DIMENSIONALITY REDUCTION)
+  • The raw 960-d FSD vector is passed through a series of learned linear
+    transforms loaded from fsd_transforms.pt (~40 MB).
+  • These transforms were learned on real images only (no synthetic data) to
+    whiten and de-correlate the FSD space, maximising sensitivity to deviations
+    from the real-image distribution.
+  • All operations remain in float64.
+
+STEP 7 — GMM SCORING
+  • A Gaussian Mixture Model (K=5 components, tied covariance, ~14 MB) was
+    fitted to the projected FSD vectors of real images.
+  • The GMM log-likelihood of the query image's FSD vector is computed:
+      raw_score = log p_GMM(fsd_vec)
+  • A z-score is derived by standardising with the training distribution:
+      z_score = (raw_score − train_mean) / train_std
+    where train_mean and train_std were computed on the real-image training set.
+
+STEP 8 — DECISION
+  • Threshold: z_score < −2.0  →  FAKE  (AI-generated)
+               z_score ≥ −2.0  →  REAL
+  • More negative z = stronger evidence of AI generation.
+  • The threshold can be tuned: −3.0 gives higher precision, −1.0 higher recall.
+
+────────────────────────────────────────────────────────────────────────────────
+3. PROBABILITY CONVERSION (EVALUATION PIPELINE)
+────────────────────────────────────────────────────────────────────────────────
+
+The raw z-score is converted to a [0,1] fake-probability for AUC computation:
+
+    P(fake) = sigmoid(−(z + threshold))
+            = 1 / (1 + exp(z + 2.0))
+
+  z = −2.0  →  P(fake) = 0.50   (decision boundary)
+  z = −4.0  →  P(fake) = 0.88
+  z = −8.0  →  P(fake) = 0.998
+  z =  0.0  →  P(fake) = 0.12
+
+────────────────────────────────────────────────────────────────────────────────
+4. PRETRAINED WEIGHTS
+────────────────────────────────────────────────────────────────────────────────
+
+Auto-downloaded from GitHub Releases on first use → cached at ~/.cache/fsd/v1.2.0/
+
+  fre.pt               ~10 KB   Forensic Residual Extractor weights
+  gmm.pt               ~14 MB   5-component GMM (tied covariance)
+  fsd_transforms.pt    ~40 MB   Learned whitening/projection transforms
+  config.json          <1 KB    Hyperparameters, file names, scoring params
+  attribution_transforms.pt  ~26 MB  (source attribution — not used here)
+  source_gmms.pt       ~207 MB  (source attribution — not used here)
+
+────────────────────────────────────────────────────────────────────────────────
+5. EVALUATION PIPELINE — THIS DEPLOYMENT
+────────────────────────────────────────────────────────────────────────────────
+
+Two parallel evaluation jobs run simultaneously on this machine:
+
+  JOB A  evaluate_datasets.py   GPUs 5, 6, 7   →  AIGI_TEST  (104,329 images)
+  JOB B  evaluate_queue.py      GPUs 2, 3, 4   →  image_eval24 (1,955) + ReWIND (5,582)
+
+Each job follows the same pipeline:
+
+  1. DATASET DISCOVERY
+     Recursively scan for 0_real/ and 1_fake/ directories under the dataset root.
+     Assign ground-truth label 0 (real) or 1 (fake) based on parent folder name.
+     Supports nested structure (e.g. TEST/cyclegan/horse/0_real/).
+
+  2. RESUME CHECK
+     Read existing predictions.csv (if any) and collect already-processed paths.
+     Only queue files NOT yet in the CSV — safe to kill and restart at any time.
+
+  3. WORKER POOL (multi-GPU)
+     Spawn one Python worker process per GPU using mp.get_context("spawn").
+     Each worker:
+       a. Sets CUDA_VISIBLE_DEVICES to its assigned GPU ID
+       b. Sets LD_LIBRARY_PATH to include the bundled cuDNN library
+          (required fix: nvidia-cudnn-cu13 remnants caused CUDNN_STATUS_NOT_INITIALIZED)
+       c. Loads the FSDDetector onto that GPU
+       d. Reads tasks from a shared multiprocessing.Queue
+       e. Writes (file_path, gt, prob, pred, error) results to a result Queue
+
+  4. INFERENCE LOOP
+     Main process feeds all pending (file_path, ground_truth) pairs into the
+     task queue, then collects results from the result queue. Results are
+     appended immediately to predictions.csv and flushed every 50 images.
+     Progress is written to progress.txt after each flush.
+
+  5. WATCHDOG (JOB A only)
+     watchdog.sh polls every 5 minutes:
+       • If main PID is dead but final_report.txt absent → restart pipeline
+       • If no new rows in CSV for 3 consecutive polls (~15 min) → restart
+     Both jobs inherit resume safety, so a restart picks up where it left off.
+
+  6. METRICS COMPUTATION (on completion)
+     sklearn.metrics: accuracy_score, roc_auc_score
+     Per-class: Real_accuracy = TP_real/N_real,  Fake_accuracy = TP_fake/N_fake
+
+  7. OUTPUT PER DATASET
+       predictions.csv       — one row per image: file_path, probability,
+                                predicted_label, ground_truth
+       result_summary.txt    — dataset stats, model info, all metrics, runtime
+       progress.txt          — live progress, ETA, GPU usage (updated continuously)
+
+────────────────────────────────────────────────────────────────────────────────
+6. DATASETS
+────────────────────────────────────────────────────────────────────────────────
+
+  AIGI_TEST       /mnt/h200_dataset/kutub/datasets/AIGI/TEST/
+                  20 generator sub-folders (ProGAN, StyleGAN, StyleGAN2, CycleGAN,
+                  StarGAN, BigGAN, GauGAN, DALL-E, LDM variants, GLIDE variants,
+                  SAN, STID, IMLE, DeepFake, CRN)
+                  52,169 real  +  52,160 fake  =  104,329 total
+
+  image_eval24    /mnt/h200_dataset/saad/datasets/images/image_eval24/
+                  Single-level 0_real/ and 1_fake/ structure
+                  ~946 real  +  ~1,009 fake  =  1,955 total
+
+  ReWIND          /mnt/h200_dataset/saad/datasets/images/ancestree/ReWIND/
+                  Multi-source: 0_real/{RRDataset, viral_bfree}
+                                1_fake/{FOSID, google_factcheck, viral_bfree}
+                  2,438 real  +  3,144 fake  =  5,582 total
+
+All datasets are mounted read-only via CIFS from H200 server (141.216.7.188)
+at /mnt/h200_dataset/. Lambda server was inaccessible (key auth failure).
+
+────────────────────────────────────────────────────────────────────────────────
+7. ENVIRONMENT
+────────────────────────────────────────────────────────────────────────────────
+
+  Conda env:       /data/awais/anaconda/envs/fsd   (Python 3.12.13)
+  PyTorch:         2.6.0+cu124
+  CUDA driver:     12.6  (560.35.03)
+  cuDNN:           9.1.0.70  (nvidia-cudnn-cu12)
+  scikit-learn:    1.8.0
+  scipy:           1.17.1
+  GPUs:            NVIDIA RTX 6000 Ada Generation (8×, 49 GB each)
+
+  cuDNN fix:       torch 2.6.0+cu124 bundles cuDNN for CUDA 12.4; a failed
+                   install of torch 2.12.0 left nvidia-cudnn-cu13 packages that
+                   shadowed the cu12 library, causing CUDNN_STATUS_NOT_INITIALIZED.
+                   Fix: uninstalled cu13 packages, force-reinstalled
+                   nvidia-cudnn-cu12==9.1.0.70, added CUDNN_LIB to LD_LIBRARY_PATH
+                   inside each worker process.
+
+────────────────────────────────────────────────────────────────────────────────
+8. PERFORMANCE CHARACTERISTICS
+────────────────────────────────────────────────────────────────────────────────
+
+  Per-image timing breakdown (RTX 6000 Ada, 1024×1024 image):
+    Image load + grayscale convert :     ~10 ms
+    FRE convolution (15×15, float64):    ~85 ms
+    Resize + crop to 1024×1024:          ~  2 ms
+    Multi-scale unfold (3 scales):       ~14 ms
+    Constrained LS solve (float64):   ~2,000 ms  ← dominant step
+    GMM scoring + projection:            ~  5 ms
+    ─────────────────────────────────────────────
+    TOTAL per image:                  ~2,100 ms
+
+  The constrained LS solve is the bottleneck: it accumulates XᵀX ∈ ℝ^{960×960}
+  over ~1.38M patches in float64. This is inherent to the algorithm's accuracy
+  requirements (float32 causes divergent results per the paper).
+
+  Observed throughput:   ~0.47 img/sec per GPU
+  Combined (3 GPUs):     ~1.42 img/sec
+
+  Estimated total runtimes:
+    AIGI_TEST    (104,329 images, GPUs 5,6,7):   ~20 hours
+    image_eval24 (  1,955 images, GPUs 2,3,4):   ~35 minutes
+    ReWIND       (  5,582 images, GPUs 2,3,4):   ~100 minutes
+
+────────────────────────────────────────────────────────────────────────────────
+9. OUTPUT FILE LOCATIONS
+────────────────────────────────────────────────────────────────────────────────
+
+  /data/awais/projects/FSD/Results/
+  ├── AIGI_TEST/
+  │   ├── predictions.csv
+  │   ├── progress.txt
+  │   └── result_summary.txt
+  ├── image_eval24/
+  │   ├── predictions.csv
+  │   ├── progress.txt
+  │   └── result_summary.txt
+  ├── ReWIND/
+  │   ├── predictions.csv
+  │   ├── progress.txt
+  │   └── result_summary.txt
+  ├── final_report.txt          (AIGI_TEST job — written on completion)
+  └── queue_final_report.txt    (Queue job — written on completion)
+
+  /data/awais/projects/FSD/logs/
+  ├── main_run.log              AIGI_TEST inference log
+  ├── queue_<ts>.log            Queue job (eval24 + ReWIND) inference log
+  ├── queue_errors_<ts>.log     Error-only log for queue job
+  ├── watchdog.log              Watchdog heartbeat log
+  ├── command_history.txt       Record of all evaluation commands run
+  └── pid.txt / watchdog_pid.txt  Process IDs
+
+================================================================================
+Generated: 2026-05-18
+================================================================================
